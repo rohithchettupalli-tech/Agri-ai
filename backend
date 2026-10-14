@@ -1,0 +1,139 @@
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from pyproj import Geod
+from typing import List
+from math import isfinite
+
+app = FastAPI(
+    title="AgriSmart AI Land Measurement API",
+    description="Calculate field distance, perimeter and area using GPS coordinates.",
+    version="1.0.0"
+)
+
+# Configure this for your website's origin before deployment.
+# This permissive setting is convenient for local development.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
+
+# WGS84 ellipsoid: appropriate for geographic GPS coordinates.
+geod = Geod(ellps="WGS84")
+
+
+class GPSPoint(BaseModel):
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+
+
+class DistanceRequest(BaseModel):
+    start: GPSPoint
+    end: GPSPoint
+
+
+class FieldRequest(BaseModel):
+    points: List[GPSPoint] = Field(min_length=3, max_length=10000)
+
+
+def validate_points(points: List[GPSPoint]):
+    for point in points:
+        if not (
+            isfinite(point.latitude)
+            and isfinite(point.longitude)
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="GPS coordinates must be finite numbers."
+            )
+
+    unique_points = {
+        (p.latitude, p.longitude) for p in points
+    }
+
+    if len(unique_points) < 3:
+        raise HTTPException(
+            status_code=422,
+            detail="Provide at least three distinct boundary points."
+        )
+
+
+@app.get("/")
+def home():
+    return {
+        "message": "AgriSmart AI Land Measurement API is running",
+        "endpoints": [
+            "/measure/distance",
+            "/measure/field",
+            "/docs"
+        ]
+    }
+
+
+@app.post("/measure/distance")
+def measure_distance(data: DistanceRequest):
+    """Calculate the geodesic distance between two GPS points."""
+
+    validate_points([data.start, data.end])
+
+    if (
+        data.start.latitude == data.end.latitude
+        and data.start.longitude == data.end.longitude
+    ):
+        distance_m = 0.0
+    else:
+        _, _, distance_m = geod.inv(
+            data.start.longitude,
+            data.start.latitude,
+            data.end.longitude,
+            data.end.latitude
+        )
+
+    return {
+        "distance_meters": round(distance_m, 2),
+        "distance_kilometers": round(distance_m / 1000, 4),
+        "distance_feet": round(distance_m * 3.28084, 2)
+    }
+
+
+@app.post("/measure/field")
+def measure_field(data: FieldRequest):
+    """
+    Calculate the area and perimeter of a field polygon.
+    The final point is automatically connected to the first.
+    """
+
+    validate_points(data.points)
+
+    longitudes = [p.longitude for p in data.points]
+    latitudes = [p.latitude for p in data.points]
+
+    # Geodesic polygon area and perimeter on the WGS84 ellipsoid.
+    signed_area_m2, perimeter_m = geod.polygon_area_perimeter(
+        longitudes,
+        latitudes
+    )
+
+    area_m2 = abs(signed_area_m2)
+
+    if area_m2 <= 0:
+        raise HTTPException(
+            status_code=422,
+            detail="The boundary does not enclose a valid area."
+        )
+
+    return {
+        "status": "success",
+        "measurement_type": "GPS field polygon",
+        "boundary_points": len(data.points),
+        "area_square_meters": round(area_m2, 2),
+        "area_acres": round(area_m2 / 4046.8564224, 4),
+        "area_hectares": round(area_m2 / 10000, 4),
+        "area_square_feet": round(area_m2 * 10.7639104, 2),
+        "perimeter_meters": round(perimeter_m, 2),
+        "perimeter_kilometers": round(perimeter_m / 1000, 4)
+    }
